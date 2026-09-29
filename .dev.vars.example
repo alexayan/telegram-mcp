@@ -1,0 +1,2 @@
+# Use npm run setup:local to generate a random local key. Never commit real keys.
+# BOT_KEYS is a JSON string: {"v1":"<32 random bytes encoded as base64url>"}

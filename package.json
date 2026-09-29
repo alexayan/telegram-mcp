@@ -1,0 +1,40 @@
+{
+  "name": "telegram-mcp",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "cf dev",
+    "build": "cf build",
+    "deploy": "node scripts/deploy.mjs",
+    "typecheck": "cf workers types && tsc",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test && npm run build",
+    "setup:local": "node scripts/setup-local.mjs",
+    "db:migrate:local": "cf d1 migrations apply 7e560d01-5666-4b29-8d26-729f9ac60d3c --local --persist-to .cloudflare/state --dir migrations",
+    "format": "prettier --write src tests config scripts *.ts *.json README.md",
+    "setup:images": "node scripts/setup-images.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "beta",
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@types/node": "^26.6.3",
+    "cf": "^1.0.0-beta.5",
+    "prettier": "^3.9.9",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0",
+    "vitest": "^4.1.11"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^1.2.1",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "agents": "^0.24.0",
+    "zod": "^4.6.5"
+  },
+  "overrides": {
+    "undici": "^7.29.1",
+    "sharp": "^0.35.4"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}
