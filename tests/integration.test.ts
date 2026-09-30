@@ -317,6 +317,189 @@ describe("privacy and tenant isolation", () => {
   });
 });
 
+describe("message time ranges", () => {
+  const iso = (seconds: number) =>
+    new Date(seconds * 1000).toISOString().replace(".000Z", "Z");
+  async function timedMessage(
+    installationId: string,
+    id: number,
+    date: number,
+  ) {
+    const update = msg(id, `range message ${id}`);
+    update.business_message!.date = date;
+    await materialize(env.DB, installationId, update);
+  }
+  it("includes the start, excludes the end, and applies bounds before pagination", async () => {
+    const { i, scope } = await fixture();
+    const start = now() - 7200;
+    for (const [id, date] of [
+      [1, start - 1],
+      [2, start],
+      [3, start + 1],
+      [4, start + 2],
+    ])
+      await timedMessage(i.id, id!, date!);
+    const input = {
+      source_key: "business:conn-a",
+      chat_id: "77",
+      start_time: start,
+      end_time: start + 2,
+      limit: 10,
+    };
+    expect(await queryMessages(env.DB, scope, input)).toMatchObject([
+      { message_id: 3 },
+      { message_id: 2 },
+    ]);
+    expect(
+      await queryMessages(env.DB, scope, { ...input, limit: 1 }),
+    ).toMatchObject([{ message_id: 3 }]);
+    expect(
+      await queryMessages(env.DB, scope, { ...input, before_message_id: 3 }),
+    ).toMatchObject([{ message_id: 2 }]);
+    expect(
+      await queryMessages(env.DB, scope, {
+        ...input,
+        query: "range message",
+        limit: 1,
+        offset: 1,
+      }),
+    ).toMatchObject([{ message_id: 2 }]);
+    expect(await queryMessages(env.DB, scope, { limit: 10 })).toHaveLength(4);
+  });
+  it("accepts either bound alone and normalizes explicit timezones", async () => {
+    const { i, scope } = await fixture();
+    const start = now() - 7200;
+    await timedMessage(i.id, 1, start - 1);
+    await timedMessage(i.id, 2, start);
+    await timedMessage(i.id, 3, start + 1);
+    expect(
+      await queryMessages(env.DB, scope, { start_time: start, limit: 10 }),
+    ).toMatchObject([{ message_id: 3 }, { message_id: 2 }]);
+    expect(
+      await queryMessages(env.DB, scope, { end_time: start, limit: 10 }),
+    ).toMatchObject([{ message_id: 1 }]);
+    const inOffset = iso(start + 8 * 3600).replace("Z", "+08:00");
+    expect(
+      await queryMessages(env.DB, scope, {
+        start_time: inOffset,
+        end_time: iso(start + 1),
+        limit: 10,
+      }),
+    ).toMatchObject([{ message_id: 2, sent_at: start }]);
+    expect(
+      await queryMessages(env.DB, scope, { start_time: 0, limit: 10 }),
+    ).toHaveLength(3);
+  });
+  it("filters edited messages by their original send time", async () => {
+    const { i, scope } = await fixture();
+    const start = now() - 7200;
+    await timedMessage(i.id, 1, start);
+    const edit = msg(2, "edited after the requested range");
+    edit.business_message!.message_id = 1;
+    edit.business_message!.date = start;
+    edit.business_message!.edit_date = start + 3600;
+    await materialize(env.DB, i.id, {
+      update_id: 2,
+      edited_business_message: edit.business_message,
+    });
+    expect(
+      await queryMessages(env.DB, scope, {
+        start_time: start,
+        end_time: start + 1,
+        limit: 10,
+      }),
+    ).toMatchObject([
+      { text: "edited after the requested range", sent_at: start },
+    ]);
+  });
+  it("applies the range to filename search as well as message text", async () => {
+    const { i, scope } = await fixture();
+    const start = now() - 7200;
+    for (const id of [1, 2]) {
+      const update = documentUpdate(id, `range-doc-${id}`, "range-report.pdf");
+      update.message!.date = start + id - 1;
+      await materialize(env.DB, i.id, update);
+      await stageDocument(env, i.id, update);
+    }
+    expect(
+      await queryMessages(env.DB, scope, {
+        query: "range-report.pdf",
+        start_time: start,
+        end_time: start + 1,
+        limit: 10,
+      }),
+    ).toMatchObject([{ message_id: 1, file_name: "range-report.pdf" }]);
+  });
+  it("preserves tenant, chat, deletion and retention restrictions with broad bounds", async () => {
+    const a = await fixture(),
+      b = await fixture();
+    const start = now() - 7200;
+    await timedMessage(a.i.id, 1, start);
+    await timedMessage(b.i.id, 2, start);
+    await timedMessage(a.i.id, 3, start);
+    await env.DB.prepare("UPDATE messages SET sent_at=? WHERE message_id=3")
+      .bind(now() - 91 * 86400)
+      .run();
+    await materialize(env.DB, a.i.id, msg(4, "hidden chat", "conn-a", 88));
+    await env.DB.prepare("UPDATE chats SET enabled=0 WHERE chat_id='88'").run();
+    await timedMessage(a.i.id, 5, start);
+    await materialize(env.DB, a.i.id, {
+      update_id: 6,
+      deleted_business_messages: {
+        business_connection_id: "conn-a",
+        chat: { id: 77 },
+        message_ids: [5],
+      },
+    });
+    await saveConnection(env.DB, a.i.id, { ...connection, id: "disabled" });
+    await materialize(env.DB, a.i.id, msg(7, "hidden connection", "disabled"));
+    await saveConnection(env.DB, a.i.id, {
+      ...connection,
+      id: "disabled",
+      is_enabled: false,
+    });
+    expect(
+      await queryMessages(env.DB, a.scope, {
+        start_time: 0,
+        end_time: now() + 3600,
+        limit: 100,
+      }),
+    ).toMatchObject([{ message_id: 1 }]);
+  });
+  it("rejects ambiguous or invalid times and non-increasing ranges", async () => {
+    const { scope } = await fixture();
+    for (const value of [
+      "2026-09-29",
+      "2026-09-29T00:00:00",
+      "2026-02-30T00:00:00Z",
+      "2026-09-29T00:00:00.123Z",
+      "2026-09-29T00:00:00+25:00",
+      "not a date",
+      "1790611200",
+      -1,
+      1.5,
+      Date.now(),
+      NaN,
+      Infinity,
+      "1969-12-31T23:59:59Z",
+    ]) {
+      for (const key of ["start_time", "end_time"]) {
+        await expect(
+          queryMessages(env.DB, scope, { [key]: value, limit: 10 }),
+        ).rejects.toThrow(`${key} must be`);
+      }
+    }
+    for (const end of [100, 99])
+      await expect(
+        queryMessages(env.DB, scope, {
+          start_time: 100,
+          end_time: end,
+          limit: 10,
+        }),
+      ).rejects.toThrow("start_time must be earlier than end_time");
+  });
+});
+
 describe("all bot chats", () => {
   it("migrates existing archives without losing data or resuming paused installations", async () => {
     await reset();
@@ -941,7 +1124,7 @@ describe("OAuth → Telegram → MCP", () => {
       code: "enrollment_unavailable",
     });
   });
-  it("completes browser consent + PKCE, exposes only four read tools, and rejects token reuse after revocation", async () => {
+  it("completes browser consent + PKCE, exposes six read tools with time filters, and rejects token reuse after revocation", async () => {
     const client = await registerClient("<script>alert(1)</script>");
     const verifier = "x".repeat(64),
       challenge = await hash(verifier);
@@ -1057,12 +1240,43 @@ describe("OAuth → Telegram → MCP", () => {
     ])
       expect(raw).toContain(name);
     expect(raw).not.toContain("send_message");
-    await materialize(env.DB, i.id, msg(1, "Visible to this grant"));
+    expect(raw.match(/"start_time":/g)).toHaveLength(2);
+    expect(raw.match(/"end_time":/g)).toHaveLength(2);
+    const rangeStart = now() - 7200;
+    const original = msg(1, "Visible to this grant");
+    original.business_message!.date = rangeStart;
+    await materialize(env.DB, i.id, original);
     const messages = await rpc("tools/call", {
       name: "get_messages",
       arguments: { source_key: "business:conn-a", chat_id: "77" },
     });
     expect(await messages.text()).toContain("Visible to this grant");
+    const excluded = msg(4, "Visible outside the range");
+    excluded.business_message!.date = rangeStart + 1;
+    await materialize(env.DB, i.id, excluded);
+    for (const name of ["get_messages", "search_messages"]) {
+      const arguments_ = {
+        source_key: "business:conn-a",
+        chat_id: "77",
+        ...(name === "search_messages" ? { query: "Visible" } : {}),
+        start_time: new Date(rangeStart * 1000)
+          .toISOString()
+          .replace(".000Z", "Z"),
+        end_time: rangeStart + 1,
+      };
+      const filtered = await rpc("tools/call", { name, arguments: arguments_ });
+      const content = await filtered.text();
+      expect(filtered.status).toBe(200);
+      expect(content).toContain("Visible to this grant");
+      expect(content).not.toContain("Visible outside the range");
+      const invalid = await rpc("tools/call", {
+        name,
+        arguments: { ...arguments_, end_time: rangeStart },
+      });
+      const error = await invalid.text();
+      expect(error).toContain('"isError":true');
+      expect(error).toContain("start_time must be earlier than end_time");
+    }
     const imageUpdate = msg(2, "image via OAuth");
     imageUpdate.business_message!.photo = [
       { file_id: "oauth-photo", width: 1, height: 1 },

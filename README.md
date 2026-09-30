@@ -7,6 +7,7 @@ Node.js 24 + TypeScript，使用 **Cloudflare `cf` CLI 1.0 beta** 的 `cloudflar
 - 自有授权页面：提交 bot token → `getMe` 验证 → 直接完成 OAuth authorization code + PKCE S256 → MCP access token。无需选择会话；一次授权覆盖该 bot 当前及未来可接收的全部会话。
 - Cloudflare OAuth Provider 负责令牌散列存储、refresh rotation、CIMD、兼容 DCR、资源 audience 校验。应用另外校验只读 scope 和租户权限。
 - 6 个 MCP 工具：`list_chats`、`get_messages`、`search_messages`、`get_sync_status`、`get_image`、`get_file`。
+- `get_messages` 与 `search_messages` 支持可选的 `start_time` / `end_time`，按消息原始发送时间查询指定区间。
 - 每 bot 一个 Durable Object，后台 long polling、加密 inbox、编辑更新、删除 tombstone、重复处理、失败退避、429 `retry_after`、401 撤销、409 停止冲突轮询。
 - 管理页面支持撤销全部 MCP 授权、暂停/恢复同步、删除全部服务数据。
 - 正文、图片和普通附件统一从原消息发送时间起保留 90 天；图片与附件原文件存储在私有 R2，仅可经 MCP 鉴权读取。支持中文及字面子串搜索，不使用外部向量库或 AI API。
@@ -67,6 +68,34 @@ npm run check
 6. 在已授权聊天中产生新消息后用 `list_chats` 查询。`get_messages` 使用返回的 `source_key` 与 `chat_id`；`search_messages` 默认搜索此 bot 的所有可访问会话。新会话不必重新授权。
 
 这里“所有会话”是 **Telegram 实际向这个 bot 投递更新的会话**。Bot 不会自动获得个人账号参加的所有群，也没有列举未投递过更新的全部会话或拉取完整历史的 Bot API。旧连接早于服务接入且没有后续事件时，可在 Telegram 重新连接来产生更新。Bot token 证明的是 bot 控制权，持有者可授权读取这个 bot 的全部数据；不要让不互信的人共用 token。
+
+## 按时间范围查询消息
+
+`get_messages` 和 `search_messages` 都支持以下可选参数，省略时保持原来的查询行为：
+
+| 参数         | 含义                                | 格式                                                     |
+| ------------ | ----------------------------------- | -------------------------------------------------------- |
+| `start_time` | 包含该时刻，即发送时间 ≥ 开始时间   | 整数 Unix 秒时间戳，或带时区、精确到秒的 ISO 8601 字符串 |
+| `end_time`   | 不包含该时刻，即发送时间 < 结束时间 | 同上                                                     |
+
+例如，查询某个群在 UTC+8 的 2026-09-29 全天消息（`source_key` 和 `chat_id` 使用 `list_chats` 返回的值）：
+
+```json
+{
+  "source_key": "bot",
+  "chat_id": "-1001234567890",
+  "start_time": "2026-09-29T00:00:00+08:00",
+  "end_time": "2026-09-30T00:00:00+08:00",
+  "limit": 100
+}
+```
+
+以上是 `get_messages` 的参数。调用 `search_messages` 时再加上 `query`，即可在同一时间范围内搜索文字、说明或附件文件名；省略 `source_key` / `chat_id` 可搜索该 bot 的全部可访问会话。
+
+- 可以只指定开始或结束时间；同时指定时必须满足 `start_time < end_time`。
+- ISO 时间必须包含秒及 `Z` 或 `+08:00` 等时区，不接受单独日期、无时区时间或小数秒。数字为秒时间戳，不是毫秒；例如 `1790611200` 等价于 `2026-09-29T00:00:00+08:00`。有效时间从 Unix epoch 到 UTC 9999 年末。
+- 按原消息 `sent_at` 筛选，编辑消息不会改变所属时间范围。区间筛选先于分页；`get_messages` 仍按消息 ID 倒序并使用 `before_message_id` 翻页，`search_messages` 仍使用 `offset` / `limit`。
+- 只能查询已同步且尚在 90 天保留期内的消息；时间参数不会回补 Telegram 历史或扩大授权范围。
 
 ## 使用 cf 部署
 
