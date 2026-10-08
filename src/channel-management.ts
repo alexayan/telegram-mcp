@@ -6,11 +6,17 @@ import type { Env, Installation, Session } from "./types";
 
 export interface ManagedChannel {
   chat_id: string;
+  chat_type: "channel" | "group" | "supergroup";
   title: string;
   enabled: number;
   left_at: number | null;
   leave_pending: number;
 }
+const chatTypeLabels = {
+  channel: "频道",
+  group: "普通群组",
+  supergroup: "超级群组",
+};
 export type LeaveResult =
   | "left"
   | "already_left"
@@ -20,14 +26,14 @@ export type LeaveResult =
   | "rejected"
   | "uncertain";
 export const leaveNotices: Record<LeaveResult, string> = {
-  left: "Bot 已退出频道，该频道的消息、图片和附件已停止向 MCP 提供。",
-  already_left: "Telegram 确认 bot 已不在该频道，本地状态已更新。",
-  invalid_request: "确认已过期、已使用或频道状态已变化，请返回管理页重新操作。",
-  rate_limited: "Telegram 请求过于频繁，请稍后返回频道列表重试。",
+  left: "Bot 已退出，该会话的消息、图片和附件已停止向 MCP 提供。",
+  already_left: "Telegram 确认 bot 已不在该会话，本地状态已更新。",
+  invalid_request: "确认已过期、已使用或会话状态已变化，请返回管理页重新操作。",
+  rate_limited: "Telegram 请求过于频繁，请稍后返回列表重试。",
   unavailable: "暂时无法查询 Telegram 状态，请稍后重试。",
   rejected: "Telegram 拒绝退出请求，尚未确认退出，请检查 bot 状态后重试。",
   uncertain:
-    "暂时无法确认退出结果，请返回频道列表查看状态并重新确认。显示“退出结果待确认”的频道已暂停向 MCP 提供数据。",
+    "暂时无法确认退出结果，请返回列表查看状态并重新确认。显示“退出结果待确认”的会话已暂停向 MCP 提供数据。",
 };
 export async function getManagedChannel(
   db: D1Database,
@@ -36,7 +42,7 @@ export async function getManagedChannel(
 ) {
   return db
     .prepare(
-      "SELECT chat_id,title,enabled,left_at,leave_pending FROM chats WHERE installation_id=? AND source_key='bot' AND chat_type='channel' AND chat_id=?",
+      "SELECT chat_id,chat_type,title,enabled,left_at,leave_pending FROM chats WHERE installation_id=? AND source_key='bot' AND chat_type IN ('channel','group','supergroup') AND chat_id=?",
     )
     .bind(id, chatId)
     .first<ManagedChannel>();
@@ -50,7 +56,7 @@ export async function channelSection(
   const cursor = url.searchParams.get("after_channel") ?? "";
   const after = /^-?\d{1,20}$/.test(cursor) ? cursor : "";
   const { results } = await env.DB.prepare(
-    "SELECT chat_id,title,enabled,left_at,leave_pending FROM chats WHERE installation_id=? AND source_key='bot' AND chat_type='channel' AND chat_id>? ORDER BY chat_id LIMIT 21",
+    "SELECT chat_id,chat_type,title,enabled,left_at,leave_pending FROM chats WHERE installation_id=? AND source_key='bot' AND chat_type IN ('channel','group','supergroup') AND chat_id>? ORDER BY chat_id LIMIT 21",
   )
     .bind(i.id, after)
     .all<ManagedChannel>();
@@ -60,7 +66,13 @@ export async function channelSection(
     notice && Object.hasOwn(leaveNotices, notice)
       ? `<p role="status">${leaveNotices[notice as LeaveResult]}</p>`
       : "";
-  return `<section id="channels"><h2>频道管理</h2>${banner}<p>显示此服务已发现的频道，状态来自最近收到的更新。Telegram 不提供 bot 全部频道的查询接口；尚未投递更新的频道不会显示。<a href="/manage#channels">刷新列表</a></p>${channels.length ? channels.map((c) => `<article><h3>${escape(c.title || "未命名频道")}</h3><p>频道 ID：<code>${escape(c.chat_id)}</code></p><p>状态：${c.leave_pending ? "退出结果待确认" : c.enabled ? "在频道内（最近同步记录）" : "已退出或不可访问"}</p>${c.enabled || c.leave_pending ? `<form method="post" action="/manage">${csrfInput(s.csrf)}<input type="hidden" name="chat_id" value="${escape(c.chat_id)}"><button class="danger" name="action" value="leave_preview">${c.leave_pending ? "确认状态并重试退出" : "Leave · 退出频道"}</button></form>` : ""}</article>`).join("") : "<p>尚无已发现的频道。Bot 加入频道或收到新的频道消息后，列表会自动更新。</p>"}${after ? '<a href="/manage#channels">返回首页</a> ' : ""}${results.length > 20 ? `<a href="/manage?after_channel=${encodeURIComponent(channels.at(-1)!.chat_id)}#channels">下一页</a>` : ""}</section>`;
+  const cards = channels
+    .map((c) => {
+      const kind = chatTypeLabels[c.chat_type];
+      return `<article><h3>${escape(c.title || "未命名会话")}</h3><p>类型：${kind} · ID：<code>${escape(c.chat_id)}</code></p><p>状态：${c.leave_pending ? "退出结果待确认" : c.enabled ? "已加入（最近同步记录）" : "已退出或不可访问"}</p>${c.enabled || c.leave_pending ? `<form method="post" action="/manage">${csrfInput(s.csrf)}<input type="hidden" name="chat_id" value="${escape(c.chat_id)}"><button class="danger" name="action" value="leave_preview">${c.leave_pending ? "确认状态并重试退出" : `Leave · 退出${c.chat_type === "channel" ? "频道" : "群组"}`}</button></form>` : ""}</article>`;
+    })
+    .join("");
+  return `<section id="channels"><h2>频道与群组管理</h2>${banner}<p>显示此服务已发现的频道、普通群组和超级群组，状态来自最近收到的更新。Telegram 不提供 bot 全部会话的查询接口；尚未投递更新的会话不会显示。私聊不在退出列表中。<a href="/manage#channels">刷新列表</a></p>${cards || "<p>尚无已发现的频道或群组。Bot 加入或收到新的频道、群组消息后，列表会自动更新。</p>"}${after ? '<a href="/manage#channels">返回首页</a> ' : ""}${results.length > 20 ? `<a href="/manage?after_channel=${encodeURIComponent(channels.at(-1)!.chat_id)}#channels">下一页</a>` : ""}</section>`;
 }
 export async function confirmChannelLeave(
   env: Env,
@@ -73,8 +85,8 @@ export async function confirmChannelLeave(
     : null;
   if (!channel || (!channel.enabled && !channel.leave_pending))
     return page(
-      "频道不可操作",
-      "<p>此频道不在当前 bot 的可退出列表中。</p>",
+      "会话不可操作",
+      "<p>此会话不在当前 bot 的可退出频道或群组列表中。</p>",
       {},
       404,
     );
@@ -90,7 +102,7 @@ export async function confirmChannelLeave(
     )
     .run();
   return page(
-    "确认退出频道",
-    `<p>你即将让 <strong>@${escape(i.username)}</strong> 退出以下频道：</p><article><h2>${escape(channel.title || "未命名频道")}</h2><code>${escape(chatId)}</code></article><p>退出后停止接收该频道的新消息，已保存的消息、图片和附件也将无法通过 MCP 读取。数据仍按原消息时间保留 ${RETENTION_DAYS} 天，到期清理；退出不等于立即删除存档。重新加入需要频道管理员操作。</p><form method="post" action="/manage">${csrfInput(s.csrf)}<input type="hidden" name="leave_token" value="${escape(confirmation)}"><label><input type="checkbox" name="confirm" value="leave" required> 我确认让这个 bot 退出上述频道</label><button class="danger" name="action" value="leave_channel">确认退出</button> <a href="/manage#channels">取消</a></form><small>确认有效期 5 分钟，仅能使用一次。退出功能仅在管理页提供。</small>`,
+    "确认退出",
+    `<p>你即将让 <strong>@${escape(i.username)}</strong> 退出以下会话：</p><article><h2>${escape(channel.title || "未命名会话")}</h2><p>类型：${chatTypeLabels[channel.chat_type]}</p><code>${escape(chatId)}</code></article><p>退出后停止接收该会话的新消息，已保存的消息、图片和附件也将无法通过 MCP 读取。数据仍按原消息时间保留 ${RETENTION_DAYS} 天，到期清理；退出不等于立即删除存档。重新加入需在 Telegram 中再次添加 bot。</p><form method="post" action="/manage">${csrfInput(s.csrf)}<input type="hidden" name="leave_token" value="${escape(confirmation)}"><label><input type="checkbox" name="confirm" value="leave" required> 我确认让这个 bot 退出上述频道或群组</label><button class="danger" name="action" value="leave_channel">确认退出</button> <a href="/manage#channels">取消</a></form><small>确认有效期 5 分钟，仅能使用一次。退出功能仅在管理页提供。</small>`,
   );
 }

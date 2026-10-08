@@ -10,7 +10,7 @@ Node.js 24 + TypeScript，使用 **Cloudflare `cf` CLI 1.0 beta** 的 `cloudflar
 - `get_messages` 与 `search_messages` 支持可选的 `start_time` / `end_time`，按消息原始发送时间查询指定区间。
 - 每 bot 一个 Durable Object，后台 long polling、加密 inbox、编辑更新、删除 tombstone、重复处理、失败退避、429 `retry_after`、401 撤销、409 停止冲突轮询。
 - 管理页面支持撤销全部 MCP 授权、暂停/恢复同步、删除全部服务数据。
-- 管理页面展示已发现频道，支持确认后让 bot 退出频道；该操作不向 MCP 客户端开放。
+- 管理页面展示已发现的频道、普通群组和超级群组，支持确认后让 bot 退出；该操作不向 MCP 客户端开放。
 - 正文、图片和普通附件统一从原消息发送时间起保留 90 天；图片与附件原文件存储在私有 R2，仅可经 MCP 鉴权读取。支持中文及字面子串搜索，不使用外部向量库或 AI API。
 
 ## 架构与权限边界
@@ -23,7 +23,7 @@ flowchart LR
   Gateway --> DB[(D1\n连接 / 会话 / 消息)]
   Gateway -->|内部 Service Binding| Sync[私有 Sync Worker]
   Sync --> Collector[每 bot 一个 Durable Object\n加密 token / inbox / offset]
-  Collector -->|读取 Bot API / 媒体下载 / 网页确认退出频道| TG[Telegram Bot API]
+  Collector -->|读取 Bot API / 媒体下载 / 网页确认退出频道或群组| TG[Telegram Bot API]
   Collector --> DB
   Collector --> R2[(私有 R2 图片和附件)]
   Gateway --> R2
@@ -34,7 +34,7 @@ flowchart LR
 
 MCP 每次请求从经过验证的授权 props 得到 `installationId + access:"bot" + epoch`，不会再次向 Telegram 查询 bot 身份。所有查询始终由授权中的 `installation_id` 限定 bot；`source_key + chat_id` 区分普通 bot 与不同 Business connection 的重叠聊天 ID。每个 MCP 请求、工具调用重查安装 epoch / 状态，并在 SQL 内过滤已撤销的 Business 连接和已知退出的群。旧的 connection 级 grant 不包含新的 `access:"bot"`，必须重新授权，不能自动扩大读取权限。
 
-**Bot token 本身不是官方的只读 token。** MCP 和后台采集只使用读取能力；管理页另外支持用户确认后调用 `leaveChat` 退出频道。读取方法限定为 `getMe/getWebhookInfo/getBusinessConnection/getUpdates/getFile/getChatMember`，不提供任意 Telegram API 代理。Business 模式不是普通 bot 的接入前提；Business 的操作权限仅记录状态，不作为读取消息的条件。仍建议在 Telegram 侧只授予所需的最少权限。已知 Business 连接会定期复查是否启用，并处理连接 / 成员状态更新；Telegram 侧撤销不是零延迟通知。
+**Bot token 本身不是官方的只读 token。** MCP 和后台采集只使用读取能力；管理页另外支持用户确认后调用 `leaveChat` 退出频道或群组。读取方法限定为 `getMe/getWebhookInfo/getBusinessConnection/getUpdates/getFile/getChatMember`，不提供任意 Telegram API 代理。Business 模式不是普通 bot 的接入前提；Business 的操作权限仅记录状态，不作为读取消息的条件。仍建议在 Telegram 侧只授予所需的最少权限。已知 Business 连接会定期复查是否启用，并处理连接 / 成员状态更新；Telegram 侧撤销不是零延迟通知。
 
 ## 本地开发
 
@@ -125,16 +125,18 @@ npm run deploy
 - 普通群聊/频道没有通用的删除消息更新，因此无法保证同步删除；其已归档正文由 90 天保留期或用户删除全部数据来清除。Business 删除更新会及时清空正文。
 - `chats` 保存已发现会话的类型、名称和成员状态，元数据保留到删除安装；发现记录不等于完整 Telegram 会话目录。
 
-## 管理频道与退出
+## 管理频道、群组与退出
 
-打开服务的 `/manage`，使用当前 Bot Token 登录，即可在“频道管理”中查看频道名称、数字 ID 和最近同步的成员状态。列表每页 20 个频道，包含已退出及退出结果待确认的记录。
+打开服务的 `/manage`，使用当前 Bot Token 登录，即可在“频道与群组管理”中查看名称、会话类型、数字 ID 和最近同步的成员状态。列表每页 20 个会话，包含已退出及退出结果待确认的记录。
 
-- 列表来自已接收的 `channel_post` / `my_chat_member` 更新。官方 Bot API 没有枚举 bot 全部频道的方法；接入前已加入且之后没有投递更新的频道无法自动列出。“刷新列表”更新本地记录，不代表对每个频道实时核验。
-- 点击 **Leave · 退出频道**，在确认页核对 bot 与频道，勾选确认并提交。确认仅有效 5 分钟、绑定当前管理会话、只能使用一次；重新打开确认页会替换该会话上一次确认。
+- 列表来自已接收的 `message` / `channel_post` / `my_chat_member` 更新。官方 Bot API 没有枚举 bot 全部频道和群组的方法；接入前已加入且之后没有投递更新的会话无法自动列出。“刷新列表”更新本地记录，不代表对每个会话实时核验。
+- 点击 **Leave · 退出频道/群组**，在确认页核对 bot 与目标会话，勾选确认并提交。确认仅有效 5 分钟、绑定当前管理会话、只能使用一次；重新打开确认页会替换该会话上一次确认。
 - 私有同步 Worker 在执行前调用 `getChatMember` 核实 bot 自己的状态，再调用 [Telegram `leaveChat`](https://core.telegram.org/bots/api#leavechat)。不要求登录网页的个人账号是频道管理员；持有 Bot Token 即代表控制该 bot。
-- 退出成功后，该频道的消息、图片和文件立即停止向 MCP 提供。存档继续按原消息发送时间保留 90 天；不会因退出立即删除，也不撤销其他频道的 MCP 授权。重新加入需要频道管理员操作，服务收到新的成员更新后恢复读取。
-- 请求结果不确定时保留“退出结果待确认”状态并阻止该频道的 MCP 读取。点击重试会先重新核实成员状态，不会自动重发退出操作。Telegram 明确拒绝请求时恢复操作前的本地状态；限流遵守 `retry_after`。
-- 退出操作与轮询串行处理，并持久化频道禁用状态，防止待处理消息或退出前的成员更新重新开放读取。Bot Token 始终留在私有同步 Worker，MCP 的 6 个工具仍全部只读，没有退出工具。
+- 退出成功后，该会话的消息、图片和文件立即停止向 MCP 提供。存档继续按原消息发送时间保留 90 天；不会因退出立即删除，也不撤销其他会话的 MCP 授权。重新加入需在 Telegram 中再次添加 bot，服务收到新的成员更新后恢复读取。
+- 请求结果不确定时保留“退出结果待确认”状态并阻止该会话的 MCP 读取。点击重试会先重新核实成员状态，不会自动重发退出操作。Telegram 明确拒绝请求时恢复操作前的本地状态；限流遵守 `retry_after`。
+- 退出操作与轮询串行处理，并持久化会话禁用状态，防止待处理消息或退出前的成员更新重新开放读取。Telegram 凭证仅由私有同步 Worker 解密，MCP 的 6 个工具仍全部只读，没有退出工具。
+
+私聊和 Business 会话不提供退出按钮。普通群组与超级群组分别标记为“普通群组”和“超级群组”，避免与 Telegram 的 `channel` 类型混淆。
 
 ## 撤销、删除、轮换
 

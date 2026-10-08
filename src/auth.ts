@@ -292,7 +292,7 @@ export async function authRoutes(
           return redirect(`/manage?channel_notice=${result}#channels`);
         return page(
           "退出尚未完成",
-          `<p role="alert">${leaveNotices[result]}</p><p><a href="/manage#channels">返回频道列表</a></p>`,
+          `<p role="alert">${leaveNotices[result]}</p><p><a href="/manage#channels">返回频道与群组列表</a></p>`,
           {},
           result === "invalid_request" ? 409 : 503,
         );

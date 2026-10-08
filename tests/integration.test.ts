@@ -826,7 +826,7 @@ describe("browser channel management", () => {
         left_at: number | null;
         leave_pending: number;
       }>();
-  it("lists only this bot's discovered channels with escaping and pagination", async () => {
+  it("lists this bot's channels with escaping and pagination, excluding private chats", async () => {
     const a = await login(),
       other = await fixture();
     for (let n = 0; n < 22; n++)
@@ -845,7 +845,7 @@ describe("browser channel management", () => {
       update_id: 51,
       message: {
         ...channelPost(51).channel_post!,
-        chat: { id: -99, type: "group", title: "Not a channel" },
+        chat: { id: 99, type: "private", title: "Private chat" },
       },
     });
     const listing = await call(
@@ -855,7 +855,7 @@ describe("browser channel management", () => {
     expect(html).toContain("&#60;script&#62;");
     expect(html).not.toContain("<script>");
     expect(html).not.toContain("Other tenant channel");
-    expect(html).not.toContain("Not a channel");
+    expect(html).not.toContain("Private chat");
     expect(html).not.toContain("Channel content");
     expect(html.match(/value="leave_preview"/g)).toHaveLength(20);
     const next = html.match(/href="(\/manage\?after_channel=[^"]+)"/)![1];
@@ -868,6 +868,90 @@ describe("browser channel management", () => {
       "frame-ancestors 'none'",
     );
   });
+  it.each([
+    {
+      type: "group" as const,
+      label: "普通群组",
+      member: { status: "member" },
+      leaves: true,
+    },
+    {
+      type: "supergroup" as const,
+      label: "超级群组",
+      member: { status: "administrator" },
+      leaves: true,
+    },
+    {
+      type: "supergroup" as const,
+      label: "超级群组",
+      member: { status: "restricted", is_member: true },
+      leaves: true,
+    },
+    {
+      type: "supergroup" as const,
+      label: "超级群组",
+      member: { status: "restricted", is_member: false },
+      leaves: false,
+    },
+  ])(
+    "shows and manages $type with membership $member",
+    async ({ type, label, member, leaves }) => {
+      const a = await login();
+      await materialize(env.DB, a.i.id, {
+        update_id: 1,
+        message: {
+          ...channelPost(1).channel_post!,
+          chat: { id: -100700, type, title: "Managed group" },
+        },
+      });
+      // A Business chat is not a group the bot can leave, even if metadata says supergroup.
+      await saveConnection(env.DB, a.i.id, connection);
+      const business = msg(2, "Business content", "conn-a", -100900);
+      business.business_message!.chat = {
+        id: -100900,
+        type,
+        title: "Business-only group",
+      };
+      await materialize(env.DB, a.i.id, business);
+      const html = await (
+        await call(request("/manage", { headers: { Cookie: a.cookie } }))
+      ).text();
+      expect(html).toContain("Managed group");
+      expect(html).toContain(`类型：${label}`);
+      expect(html).toContain("Leave · 退出群组");
+      expect(html).not.toContain("Business-only group");
+      expect(
+        (
+          await call(
+            post(
+              "/manage",
+              { csrf: a.csrf, action: "leave_preview", chat_id: "-100900" },
+              a.cookie,
+            ),
+          )
+        ).status,
+      ).toBe(404);
+      const confirmation = await prepare(a);
+      expect(confirmation.html).toContain(`类型：${label}`);
+      vi.mocked(fetch).mockClear();
+      mock("getChatMember", member);
+      if (leaves) mock("leaveChat", true);
+      const result = await call(post("/manage", confirmation.form, a.cookie));
+      expect(result.status).toBe(303);
+      expect(result.headers.get("Location")).toContain(
+        leaves ? "channel_notice=left" : "channel_notice=already_left",
+      );
+      expect(
+        vi
+          .mocked(fetch)
+          .mock.calls.filter(([url]) => String(url).endsWith("/leaveChat")),
+      ).toHaveLength(leaves ? 1 : 0);
+      expect(await stateOf(a.i)).toMatchObject({
+        enabled: 0,
+        leave_pending: 0,
+      });
+    },
+  );
   it("requires confirmation, leaves exactly once and hides messages and saved media", async () => {
     const a = await login();
     const image = channelPost(1);
@@ -969,7 +1053,7 @@ describe("browser channel management", () => {
     expect(await stateOf(a.i)).toMatchObject({ enabled: 1, left_at: null });
     expect(await queryMessages(env.DB, scope, { limit: 10 })).toHaveLength(2);
   });
-  it("rejects unauthenticated, cross-origin, forged, cross-tenant and non-channel requests", async () => {
+  it("rejects unauthenticated, cross-origin, forged, cross-tenant and private-chat requests", async () => {
     const a = await login(),
       other = await fixture();
     await materialize(env.DB, a.i.id, channelPost(1));
@@ -978,7 +1062,7 @@ describe("browser channel management", () => {
       update_id: 3,
       message: {
         ...channelPost(3).channel_post!,
-        chat: { id: -99, type: "group" },
+        chat: { id: 99, type: "private" },
       },
     });
     vi.mocked(fetch).mockClear();
@@ -991,7 +1075,7 @@ describe("browser channel management", () => {
     const crossOrigin = post("/manage", form, a.cookie);
     crossOrigin.headers.set("Origin", "https://evil.example");
     expect((await call(crossOrigin)).status).toBe(403);
-    for (const chat_id of ["-100900", "-99", "@arbitrary", "-1' OR 1=1--"])
+    for (const chat_id of ["-100900", "99", "@arbitrary", "-1' OR 1=1--"])
       expect(
         (await call(post("/manage", { ...form, chat_id }, a.cookie))).status,
       ).toBe(404);

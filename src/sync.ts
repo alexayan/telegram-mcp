@@ -204,7 +204,10 @@ export class BotCollector extends DurableObject<SyncEnv> {
           chat_id: chatId,
           user_id: Number(state.botId),
         });
-        if (["left", "kicked"].includes(member.status)) {
+        if (
+          ["left", "kicked"].includes(member.status) ||
+          (member.status === "restricted" && member.is_member === false)
+        ) {
           await this.env.DB.prepare(
             "UPDATE chats SET enabled=0,left_at=?,leave_pending=0 WHERE installation_id=? AND source_key='bot' AND chat_id=?",
           )
@@ -212,7 +215,10 @@ export class BotCollector extends DurableObject<SyncEnv> {
             .run();
           return "already_left";
         }
-        if (!["member", "administrator", "creator"].includes(member.status))
+        if (
+          !["member", "administrator", "creator"].includes(member.status) &&
+          !(member.status === "restricted" && member.is_member === true)
+        )
           return "rejected";
         // The block survives crashes or ambiguous network outcomes, and prevents inbox replay
         // from re-enabling a channel while leaveChat is in flight.
