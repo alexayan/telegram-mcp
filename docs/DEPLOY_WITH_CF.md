@@ -174,7 +174,7 @@ npm run deploy
 3. 发布 `telegram-mcp-sync`，只给该 Worker 上传 `BOT_KEYS`。
 4. 发布 `telegram-mcp`，配置其内部服务绑定。
 
-当前迁移包括 `0001_initial.sql`、`0002_all_bot_chats.sql`、`0003_images.sql`、`0004_documents.sql` 和 `0005_retention_90_days.sql`。无需先执行本地迁移，也无需单独手动创建 Durable Object namespace 或 Cron。
+当前迁移包括 `0001_initial.sql`、`0002_all_bot_chats.sql`、`0003_images.sql`、`0004_documents.sql`、`0005_retention_90_days.sql` 和 `0006_channel_management.sql`。最后一项添加网页退出频道的一次性确认和状态字段，保留已有聊天数据。无需先执行本地迁移，也无需单独手动创建 Durable Object namespace 或 Cron。
 
 成功后，CLI 输出公开 Worker URL。确认该 URL 与 `PUBLIC_ORIGIN` 一致。MCP 地址为：
 
@@ -278,7 +278,7 @@ npm run deploy
 
 分享源码时排除 `.cloudflare/`、`.wrangler/`、`.dev.vars`、生产 secret 文件和聊天备份。`.gitignore` 只影响 Git 的忽略规则，不会自动过滤手工压缩的目录，也不会移除已经提交的文件。
 
-当前部署提供的是只读 Telegram MCP。Bot Token 和待处理更新有应用层加密；聊天正文在 D1 中可查询，图片和附件以原始文件内容存入私有 R2。**这不是端到端加密**；部署管理员仍处于数据的信任边界内。
+当前部署提供的是只读 Telegram MCP；登录后的管理页另提供确认退出频道的 `leaveChat` 操作，MCP 客户端不能调用。Bot Token 和待处理更新有应用层加密；聊天正文在 D1 中可查询，图片和附件以原始文件内容存入私有 R2。**这不是端到端加密**；部署管理员仍处于数据的信任边界内。
 
 生产配置与 key ring 不应提交到源码仓库。清理 `.cloudflare/` 前先备份；该目录在本项目中同时包含可再生成的构建产物和不可随意丢失的生产配置、密钥与本地数据。
 

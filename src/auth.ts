@@ -1,5 +1,11 @@
 import { RETENTION_DAYS } from "../config/retention";
 import {
+  channelSection,
+  confirmChannelLeave,
+  leaveNotices,
+  type LeaveResult,
+} from "./channel-management";
+import {
   AuthFlowError,
   authFailures,
   reportAuthFailure,
@@ -212,9 +218,10 @@ export async function authRoutes(
       );
     }
     const { s, i } = current;
+    const channels = await channelSection(env, i, s, url);
     return page(
       "连接管理",
-      `<article><p>Bot：@${escape(i.username)} · ${escape(i.bot_id)}</p><p>范围：此 bot 可接收的全部会话</p><p>状态：${escape(i.status)} / ${escape(i.error_code ?? "正常")}</p><p>上次同步：${escape(i.last_sync ? new Date(i.last_sync * 1000).toISOString() : "尚未同步")}</p></article><p>撤销会让此 bot 的全部 MCP 授权立即失效。暂停同时停止同步。恢复后，MCP 客户端需要重新授权。</p><form method="post" action="/manage">${csrfInput(s.csrf)}<button name="action" value="revoke">撤销全部 MCP 授权</button><button name="action" value="disconnect">暂停同步并撤销</button><button name="action" value="resume">恢复同步</button></form><article><p>删除会移除数据库中的消息、连接、加密凭证与已保存图片和附件。Cloudflare 备份/恢复窗口由基础设施策略决定。</p><form method="post" action="/manage">${csrfInput(s.csrf)}<label><input type="checkbox" name="confirm" value="delete" required> 我确认删除这个 bot 的全部服务数据</label><button class="danger" name="action" value="delete">删除全部数据</button></form></article>`,
+      `<article><p>Bot：@${escape(i.username)} · ${escape(i.bot_id)}</p><p>范围：此 bot 可接收的全部会话</p><p>状态：${escape(i.status)} / ${escape(i.error_code ?? "正常")}</p><p>上次同步：${escape(i.last_sync ? new Date(i.last_sync * 1000).toISOString() : "尚未同步")}</p></article>${channels}<h2>连接设置</h2><p>撤销会让此 bot 的全部 MCP 授权立即失效。暂停同时停止同步。恢复后，MCP 客户端需要重新授权。</p><form method="post" action="/manage">${csrfInput(s.csrf)}<button name="action" value="revoke">撤销全部 MCP 授权</button><button name="action" value="disconnect">暂停同步并撤销</button><button name="action" value="resume">恢复同步</button></form><article><p>删除会移除数据库中的消息、连接、加密凭证与已保存图片和附件。Cloudflare 备份/恢复窗口由基础设施策略决定。</p><form method="post" action="/manage">${csrfInput(s.csrf)}<label><input type="checkbox" name="confirm" value="delete" required> 我确认删除这个 bot 的全部服务数据</label><button class="danger" name="action" value="delete">删除全部数据</button></form></article>`,
     );
   }
   if (url.pathname === "/manage/login" && request.method === "POST") {
@@ -262,6 +269,34 @@ export async function authRoutes(
       if (form.get("csrf") !== s.csrf)
         return new Response("Forbidden", { status: 403 });
       const action = form.get("action");
+      if (action === "leave_preview")
+        return confirmChannelLeave(env, i, s, form.get("chat_id") ?? "");
+      if (action === "leave_channel") {
+        const confirmation = form.get("leave_token") ?? "";
+        if (
+          form.get("confirm") !== "leave" ||
+          !/^[A-Za-z0-9_-]{43}$/.test(confirmation)
+        )
+          return new Response("Bad request", { status: 400 });
+        let result: LeaveResult;
+        try {
+          result = await env.SYNC.leaveChannel(
+            i.bot_id,
+            s.token_hash,
+            await hash(confirmation),
+          );
+        } catch {
+          result = "uncertain";
+        }
+        if (result === "left" || result === "already_left")
+          return redirect(`/manage?channel_notice=${result}#channels`);
+        return page(
+          "退出尚未完成",
+          `<p role="alert">${leaveNotices[result]}</p><p><a href="/manage#channels">返回频道列表</a></p>`,
+          {},
+          result === "invalid_request" ? 409 : 503,
+        );
+      }
       if (
         !["revoke", "disconnect", "delete", "resume"].includes(action ?? "") ||
         (action === "delete" && form.get("confirm") !== "delete")

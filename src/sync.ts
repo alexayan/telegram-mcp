@@ -11,6 +11,7 @@ import {
   deleteInstallationDocuments,
 } from "./documents";
 import { AuthFlowError, type AuthFailureCode } from "./auth-errors";
+import { getManagedChannel, type LeaveResult } from "./channel-management";
 import { writeInbox, readInbox, clearInbox, minimalUpdate } from "./inbox";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { hash, seal, unseal, type Sealed } from "./crypto";
@@ -22,7 +23,12 @@ import {
   retain,
   saveConnection,
 } from "./store";
-import { telegram, TelegramError, validateTokenFormat } from "./telegram";
+import {
+  telegram,
+  leaveTelegramChannel,
+  TelegramError,
+  validateTokenFormat,
+} from "./telegram";
 import type { Installation, SyncEnv, TelegramUpdate } from "./types";
 
 interface CollectorState {
@@ -33,6 +39,7 @@ interface CollectorState {
   offset: number;
   failures: number;
   lastCheck: number;
+  managementRetryAt?: number;
 }
 interface Inbox {
   nextOffset: number;
@@ -157,6 +164,106 @@ export class BotCollector extends DurableObject<SyncEnv> {
           .bind(id)
           .run();
         await this.ctx.storage.setAlarm(Date.now() + 1000);
+      }
+    });
+  }
+  async leaveChannel(
+    sessionHash: string,
+    confirmationHash: string,
+  ): Promise<LeaveResult> {
+    return this.exclusive(async () => {
+      const state = await this.ctx.storage.get<CollectorState>("state");
+      if (!state) return "invalid_request";
+      const i = await getInstallation(this.env.DB, state.installationId);
+      if (!i || !["active", "paused"].includes(i.status))
+        return "invalid_request";
+      // Validate and atomically consume the browser's confirmation inside the serialized RPC.
+      // Neither a bot ID nor a chat ID supplied by a caller is sufficient authorization.
+      const confirmed = await this.env.DB.prepare(
+        `UPDATE sessions SET leave_token_hash=NULL,leave_expires_at=NULL
+         WHERE token_hash=? AND installation_id=? AND epoch=? AND expires_at>?
+         AND leave_token_hash=? AND leave_expires_at>? RETURNING leave_chat_id`,
+      )
+        .bind(sessionHash, i.id, i.epoch, now(), confirmationHash, now())
+        .first<{ leave_chat_id: string }>();
+      if (!confirmed || !/^-\d{1,19}$/.test(confirmed.leave_chat_id))
+        return "invalid_request";
+      const chatId = confirmed.leave_chat_id;
+      const channel = await getManagedChannel(this.env.DB, i.id, chatId);
+      if (!channel || (!channel.enabled && !channel.leave_pending))
+        return "invalid_request";
+      if ((state.managementRetryAt ?? 0) > now()) return "rate_limited";
+      const token = await unseal(
+        state.token,
+        `bot:${i.id}:${state.botId}`,
+        this.env.BOT_KEYS,
+      );
+      let attempted = false;
+      try {
+        const member = await telegram(token, "getChatMember", {
+          chat_id: chatId,
+          user_id: Number(state.botId),
+        });
+        if (["left", "kicked"].includes(member.status)) {
+          await this.env.DB.prepare(
+            "UPDATE chats SET enabled=0,left_at=?,leave_pending=0 WHERE installation_id=? AND source_key='bot' AND chat_id=?",
+          )
+            .bind(now(), i.id, chatId)
+            .run();
+          return "already_left";
+        }
+        if (!["member", "administrator", "creator"].includes(member.status))
+          return "rejected";
+        // The block survives crashes or ambiguous network outcomes, and prevents inbox replay
+        // from re-enabling a channel while leaveChat is in flight.
+        await this.env.DB.prepare(
+          "UPDATE chats SET enabled=0,left_at=?,leave_pending=1 WHERE installation_id=? AND source_key='bot' AND chat_id=?",
+        )
+          .bind(now(), i.id, chatId)
+          .run();
+        attempted = true;
+        if ((await leaveTelegramChannel(token, chatId)) !== true)
+          throw new TelegramError(502);
+        await this.env.DB.prepare(
+          "UPDATE chats SET leave_pending=0 WHERE installation_id=? AND source_key='bot' AND chat_id=?",
+        )
+          .bind(i.id, chatId)
+          .run();
+        return "left";
+      } catch (error) {
+        if (
+          error instanceof TelegramError &&
+          [400, 403, 429].includes(error.code)
+        ) {
+          if (attempted)
+            await this.env.DB.prepare(
+              "UPDATE chats SET enabled=?,left_at=?,leave_pending=? WHERE installation_id=? AND source_key='bot' AND chat_id=?",
+            )
+              .bind(
+                channel.enabled,
+                channel.left_at,
+                channel.leave_pending,
+                i.id,
+                chatId,
+              )
+              .run();
+          if (error.code === 429) {
+            state.managementRetryAt = now() + error.retryAfter;
+            await this.ctx.storage.put("state", state);
+            return "rate_limited";
+          }
+          return "rejected";
+        }
+        if (error instanceof TelegramError && error.code === 401) {
+          await this.env.DB.prepare(
+            "UPDATE installations SET status='invalid',epoch=epoch+1,error_code='telegram_401' WHERE id=?",
+          )
+            .bind(i.id)
+            .run();
+          await this.ctx.storage.deleteAlarm();
+        }
+        // Do not retry a mutation automatically or expose upstream error text/credential URLs.
+        return attempted ? "uncertain" : "unavailable";
       }
     });
   }
@@ -415,6 +522,16 @@ export default class SyncService extends WorkerEntrypoint<SyncEnv> {
     action: "revoke" | "disconnect" | "delete" | "resume",
   ) {
     return this.env.COLLECTORS.getByName(botId).control(action);
+  }
+  async leaveChannel(
+    botId: string,
+    sessionHash: string,
+    confirmationHash: string,
+  ) {
+    return this.env.COLLECTORS.getByName(botId).leaveChannel(
+      sessionHash,
+      confirmationHash,
+    );
   }
   async scheduled() {
     await retain(this.env.DB);

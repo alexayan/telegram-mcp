@@ -70,11 +70,16 @@ export async function saveChat(
   chat: TelegramChat,
   updateId: number,
   enabled = true,
+  membershipDate?: number,
 ) {
   await db
     .prepare(
       `INSERT INTO chats(installation_id,source_key,chat_id,chat_type,title,enabled,last_update) VALUES(?,?,?,?,?,?,?)
-    ON CONFLICT(installation_id,source_key,chat_id) DO UPDATE SET chat_type=excluded.chat_type,title=excluded.title,enabled=excluded.enabled,last_update=excluded.last_update
+    ON CONFLICT(installation_id,source_key,chat_id) DO UPDATE SET chat_type=excluded.chat_type,title=excluded.title,
+    enabled=CASE WHEN chats.left_at IS NOT NULL AND ?<=chats.left_at THEN 0 ELSE excluded.enabled END,
+    left_at=CASE WHEN ?>chats.left_at AND excluded.enabled=1 THEN NULL ELSE chats.left_at END,
+    leave_pending=CASE WHEN ?>chats.left_at OR (?=chats.left_at AND excluded.enabled=0) THEN 0 ELSE chats.leave_pending END,
+    last_update=excluded.last_update
     WHERE excluded.last_update >= chats.last_update`,
     )
     .bind(
@@ -88,6 +93,10 @@ export async function saveChat(
       ).slice(0, 256),
       Number(enabled),
       updateId,
+      membershipDate ?? 0,
+      membershipDate ?? 0,
+      membershipDate ?? 0,
+      membershipDate ?? 0,
     )
     .run();
 }
@@ -112,6 +121,7 @@ export async function materialize(
       update.my_chat_member.chat,
       update.update_id,
       enabled,
+      update.my_chat_member.date,
     );
     return;
   }

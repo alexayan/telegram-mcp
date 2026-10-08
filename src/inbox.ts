@@ -72,6 +72,7 @@ export function minimalUpdate(update: TelegramUpdate): TelegramUpdate {
       update_id: update.update_id,
       my_chat_member: {
         chat: cleanChat(c.chat),
+        date: c.date,
         new_chat_member: {
           status: c.new_chat_member.status,
           is_member: c.new_chat_member.is_member,

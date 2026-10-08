@@ -88,6 +88,7 @@ export interface TelegramUpdate {
   edited_channel_post?: TelegramMessage;
   my_chat_member?: {
     chat: TelegramChat;
+    date?: number;
     new_chat_member: { status: string; is_member?: boolean };
   };
   business_connection?: BusinessConnection;

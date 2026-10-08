@@ -753,6 +753,377 @@ describe("all bot chats", () => {
   });
 });
 
+describe("browser channel management", () => {
+  const channelPost = (
+    id: number,
+    chatId = -100700,
+    title = "Managed channel",
+  ): TelegramUpdate => ({
+    update_id: id,
+    channel_post: {
+      message_id: id,
+      chat: { id: chatId, type: "channel", title },
+      date: now(),
+      text: "Channel content",
+    },
+  });
+  async function login() {
+    const first = await call(request("/manage"));
+    mock("getMe", me);
+    mock("getWebhookInfo", { url: "" });
+    const loggedIn = await call(
+      post(
+        "/manage/login",
+        {
+          csrf: hidden(await first.text(), "csrf"),
+          bot_token: token,
+        },
+        cookies(first),
+      ),
+    );
+    expect(loggedIn.status).toBe(303);
+    const cookie = cookies(loggedIn);
+    const i = (await env.DB.prepare(
+      "SELECT * FROM installations WHERE bot_id=?",
+    )
+      .bind(String(me.id))
+      .first<Installation>())!;
+    const html = await (
+      await call(request("/manage", { headers: { Cookie: cookie } }))
+    ).text();
+    return { i, cookie, csrf: hidden(html, "csrf") };
+  }
+  async function prepare(
+    a: Awaited<ReturnType<typeof login>>,
+    chatId = "-100700",
+  ) {
+    const preview = await call(
+      post(
+        "/manage",
+        { csrf: a.csrf, action: "leave_preview", chat_id: chatId },
+        a.cookie,
+      ),
+    );
+    expect(preview.status).toBe(200);
+    const html = await preview.text();
+    return {
+      html,
+      form: {
+        csrf: a.csrf,
+        action: "leave_channel",
+        confirm: "leave",
+        leave_token: hidden(html, "leave_token"),
+      },
+    };
+  }
+  const stateOf = (i: Installation) =>
+    env.DB.prepare(
+      "SELECT enabled,left_at,leave_pending FROM chats WHERE installation_id=? AND source_key='bot' AND chat_id='-100700'",
+    )
+      .bind(i.id)
+      .first<{
+        enabled: number;
+        left_at: number | null;
+        leave_pending: number;
+      }>();
+  it("lists only this bot's discovered channels with escaping and pagination", async () => {
+    const a = await login(),
+      other = await fixture();
+    for (let n = 0; n < 22; n++)
+      await materialize(env.DB, a.i.id, channelPost(n + 1, -100700 - n));
+    await materialize(
+      env.DB,
+      a.i.id,
+      channelPost(50, -100700, '<script>alert("channel")</script>'),
+    );
+    await materialize(
+      env.DB,
+      other.i.id,
+      channelPost(1, -100900, "Other tenant channel"),
+    );
+    await materialize(env.DB, a.i.id, {
+      update_id: 51,
+      message: {
+        ...channelPost(51).channel_post!,
+        chat: { id: -99, type: "group", title: "Not a channel" },
+      },
+    });
+    const listing = await call(
+      request("/manage", { headers: { Cookie: a.cookie } }),
+    );
+    const html = await listing.text();
+    expect(html).toContain("&#60;script&#62;");
+    expect(html).not.toContain("<script>");
+    expect(html).not.toContain("Other tenant channel");
+    expect(html).not.toContain("Not a channel");
+    expect(html).not.toContain("Channel content");
+    expect(html.match(/value="leave_preview"/g)).toHaveLength(20);
+    const next = html.match(/href="(\/manage\?after_channel=[^"]+)"/)![1];
+    const second = await (
+      await call(request(next, { headers: { Cookie: a.cookie } }))
+    ).text();
+    expect(second.match(/value="leave_preview"/g)).toHaveLength(2);
+    expect(second).not.toContain("下一页");
+    expect(listing.headers.get("Content-Security-Policy")).toContain(
+      "frame-ancestors 'none'",
+    );
+  });
+  it("requires confirmation, leaves exactly once and hides messages and saved media", async () => {
+    const a = await login();
+    const image = channelPost(1);
+    image.channel_post!.photo = [
+      { file_id: "channel-photo", width: 1, height: 1 },
+    ];
+    const doc = channelPost(2);
+    doc.channel_post!.document = {
+      file_id: "channel-pdf",
+      file_name: "channel.pdf",
+      mime_type: "application/pdf",
+    };
+    await materialize(env.DB, a.i.id, image);
+    await stageImage(env, a.i.id, image);
+    await materialize(env.DB, a.i.id, doc);
+    await stageDocument(env, a.i.id, doc);
+    mock("getFile", { file_path: "photos/channel.png" });
+    downloads.set("channel.png", () => new Response(png));
+    await processImages(env, a.i.id, token);
+    mock("getFile", { file_path: "documents/channel.pdf" });
+    downloads.set("channel.pdf", () => new Response(pdf));
+    await processDocuments(env, a.i.id, token);
+    const imageId = (await env.DB.prepare("SELECT id FROM images").first<{
+      id: string;
+    }>())!.id;
+    const docId = (await env.DB.prepare("SELECT id FROM documents").first<{
+      id: string;
+    }>())!.id;
+    const scope: GrantProps = {
+      installationId: a.i.id,
+      access: "bot",
+      epoch: a.i.epoch,
+    };
+    expect(await readImage(env, scope, imageId)).toBeTruthy();
+    expect(await readDocument(env, scope, docId)).toBeTruthy();
+    const prepared = await prepare(a);
+    expect(prepared.html).toContain("Managed channel");
+    expect(prepared.html).toContain("-100700");
+    const session = (await env.DB.prepare(
+      "SELECT token_hash,leave_token_hash FROM sessions",
+    ).first<{ token_hash: string; leave_token_hash: string }>())!;
+    expect(session.leave_token_hash).toBe(
+      await hash(prepared.form.leave_token),
+    );
+    expect(session.leave_token_hash).not.toBe(prepared.form.leave_token);
+    vi.mocked(fetch).mockClear();
+    mock("getChatMember", { status: "administrator" });
+    mock("leaveChat", true);
+    const responses = await Promise.all([
+      call(post("/manage", prepared.form, a.cookie)),
+      call(post("/manage", prepared.form, a.cookie)),
+    ]);
+    expect(responses.map((r) => r.status).sort()).toEqual([303, 409]);
+    const calls = vi.mocked(fetch).mock.calls;
+    expect(
+      calls.filter(([url]) => String(url).endsWith("/leaveChat")),
+    ).toHaveLength(1);
+    expect(JSON.parse(calls[0]![1]!.body as string)).toEqual({
+      chat_id: "-100700",
+      user_id: me.id,
+    });
+    expect(JSON.parse(calls[1]![1]!.body as string)).toEqual({
+      chat_id: "-100700",
+    });
+    expect(await stateOf(a.i)).toMatchObject({ enabled: 0, leave_pending: 0 });
+    expect(await queryMessages(env.DB, scope, { limit: 10 })).toEqual([]);
+    expect(await queryChats(env.DB, scope, { limit: 10 })).toEqual([]);
+    expect(await readImage(env, scope, imageId)).toBeNull();
+    expect(await readDocument(env, scope, docId)).toBeNull();
+    expect((await getInstallation(env.DB, a.i.id))!.epoch).toBe(a.i.epoch);
+    // Newer delivery IDs do not make old messages or pre-leave membership updates authoritative.
+    const leftAt = (await stateOf(a.i))!.left_at!;
+    await materialize(env.DB, a.i.id, channelPost(100));
+    await materialize(
+      env.DB,
+      a.i.id,
+      minimalUpdate({
+        update_id: 101,
+        my_chat_member: {
+          chat: image.channel_post!.chat,
+          date: leftAt - 1,
+          new_chat_member: { status: "administrator" },
+        },
+      }),
+    );
+    expect(await queryMessages(env.DB, scope, { limit: 10 })).toEqual([]);
+    await materialize(
+      env.DB,
+      a.i.id,
+      minimalUpdate({
+        update_id: 102,
+        my_chat_member: {
+          chat: image.channel_post!.chat,
+          date: leftAt + 1,
+          new_chat_member: { status: "administrator" },
+        },
+      }),
+    );
+    expect(await stateOf(a.i)).toMatchObject({ enabled: 1, left_at: null });
+    expect(await queryMessages(env.DB, scope, { limit: 10 })).toHaveLength(2);
+  });
+  it("rejects unauthenticated, cross-origin, forged, cross-tenant and non-channel requests", async () => {
+    const a = await login(),
+      other = await fixture();
+    await materialize(env.DB, a.i.id, channelPost(1));
+    await materialize(env.DB, other.i.id, channelPost(2, -100900));
+    await materialize(env.DB, a.i.id, {
+      update_id: 3,
+      message: {
+        ...channelPost(3).channel_post!,
+        chat: { id: -99, type: "group" },
+      },
+    });
+    vi.mocked(fetch).mockClear();
+    const form = { csrf: a.csrf, action: "leave_preview", chat_id: "-100700" };
+    expect((await call(post("/manage", form))).status).toBe(401);
+    expect(
+      (await call(post("/manage", { ...form, csrf: "forged" }, a.cookie)))
+        .status,
+    ).toBe(403);
+    const crossOrigin = post("/manage", form, a.cookie);
+    crossOrigin.headers.set("Origin", "https://evil.example");
+    expect((await call(crossOrigin)).status).toBe(403);
+    for (const chat_id of ["-100900", "-99", "@arbitrary", "-1' OR 1=1--"])
+      expect(
+        (await call(post("/manage", { ...form, chat_id }, a.cookie))).status,
+      ).toBe(404);
+    const prepared = await prepare(a);
+    expect(
+      (await call(post("/manage", { ...prepared.form, confirm: "" }, a.cookie)))
+        .status,
+    ).toBe(400);
+    expect(
+      (
+        await call(
+          post(
+            "/manage",
+            { ...prepared.form, leave_token: "x".repeat(43) },
+            a.cookie,
+          ),
+        )
+      ).status,
+    ).toBe(409);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+  it("binds confirmations to the session, installation, epoch and expiry", async () => {
+    const a = await login();
+    await materialize(env.DB, a.i.id, channelPost(1));
+    const prepared = await prepare(a);
+    const session = (await env.DB.prepare(
+      "SELECT token_hash FROM sessions",
+    ).first<{ token_hash: string }>())!;
+    const other = await env.COLLECTORS.getByName("other-bot").enroll(
+      token,
+      "456789123",
+      "other",
+    );
+    vi.mocked(fetch).mockClear();
+    expect(
+      await env.COLLECTORS.getByName("other-bot").leaveChannel(
+        session.token_hash,
+        await hash(prepared.form.leave_token),
+      ),
+    ).toBe("invalid_request");
+    await env.DB.prepare("UPDATE sessions SET leave_expires_at=?")
+      .bind(now() - 1)
+      .run();
+    expect((await call(post("/manage", prepared.form, a.cookie))).status).toBe(
+      409,
+    );
+    const fresh = await prepare(a);
+    await env.DB.prepare("UPDATE installations SET epoch=epoch+1 WHERE id=?")
+      .bind(a.i.id)
+      .run();
+    expect(
+      await env.COLLECTORS.getByName(a.i.bot_id).leaveChannel(
+        session.token_hash,
+        await hash(fresh.form.leave_token),
+      ),
+    ).toBe("invalid_request");
+    expect((await call(post("/manage", fresh.form, a.cookie))).status).toBe(
+      401,
+    );
+    expect(other.id).not.toBe(a.i.id);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+  it("preserves access on Telegram rejection and respects retry_after", async () => {
+    const a = await login();
+    await materialize(env.DB, a.i.id, channelPost(1));
+    mock("getChatMember", { status: "administrator" });
+    mock("leaveChat", null, 403);
+    const first = await call(
+      post("/manage", (await prepare(a)).form, a.cookie),
+    );
+    expect(first.status).toBe(503);
+    expect(await first.text()).not.toContain(token);
+    expect(await stateOf(a.i)).toMatchObject({
+      enabled: 1,
+      left_at: null,
+      leave_pending: 0,
+    });
+    mock("getChatMember", { status: "administrator" });
+    mock("leaveChat", null, 429);
+    const limited = await call(
+      post("/manage", (await prepare(a)).form, a.cookie),
+    );
+    expect(await limited.text()).toContain("请求过于频繁");
+    vi.mocked(fetch).mockClear();
+    const retry = await call(
+      post("/manage", (await prepare(a)).form, a.cookie),
+    );
+    expect(await retry.text()).toContain("请求过于频繁");
+    expect(fetch).not.toHaveBeenCalled();
+    expect(await stateOf(a.i)).toMatchObject({ enabled: 1, left_at: null });
+  });
+  it("persists an uncertain outcome and resolves it without retrying leaveChat when already out", async () => {
+    const a = await login();
+    await materialize(env.DB, a.i.id, channelPost(1));
+    mock("getChatMember", { status: "administrator" });
+    mock("leaveChat", null, 503);
+    const response = await call(
+      post("/manage", (await prepare(a)).form, a.cookie),
+    );
+    expect(response.status).toBe(503);
+    expect(await stateOf(a.i)).toMatchObject({ enabled: 0, leave_pending: 1 });
+    await materialize(env.DB, a.i.id, channelPost(2));
+    expect(await stateOf(a.i)).toMatchObject({ enabled: 0, leave_pending: 1 });
+    const listing = await (
+      await call(request("/manage", { headers: { Cookie: a.cookie } }))
+    ).text();
+    expect(listing).toContain("确认状态并重试退出");
+    vi.mocked(fetch).mockClear();
+    mock("getChatMember", { status: "left" });
+    const reconciled = await call(
+      post("/manage", (await prepare(a)).form, a.cookie),
+    );
+    expect(reconciled.headers.get("Location")).toContain("already_left");
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(await stateOf(a.i)).toMatchObject({ enabled: 0, leave_pending: 0 });
+  });
+  it("revokes a rejected bot token without attempting leaveChat", async () => {
+    const a = await login();
+    await materialize(env.DB, a.i.id, channelPost(1));
+    const prepared = await prepare(a);
+    vi.mocked(fetch).mockClear();
+    mock("getChatMember", null, 401);
+    const response = await call(post("/manage", prepared.form, a.cookie));
+    expect(response.status).toBe(503);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(await getInstallation(env.DB, a.i.id)).toMatchObject({
+      status: "invalid",
+      epoch: a.i.epoch + 1,
+    });
+  });
+});
+
 describe("durable collector", () => {
   it("stores large encrypted batches in bounded chunks and strips reply/media metadata", async () => {
     const { i } = await fixture();
@@ -1240,6 +1611,14 @@ describe("OAuth → Telegram → MCP", () => {
     ])
       expect(raw).toContain(name);
     expect(raw).not.toContain("send_message");
+    expect(raw).not.toContain("leave_channel");
+    const callsBeforeLeave = vi.mocked(fetch).mock.calls.length;
+    const forbiddenLeave = await rpc("tools/call", {
+      name: "leave_channel",
+      arguments: { chat_id: "-100700" },
+    });
+    expect(await forbiddenLeave.text()).toContain("not found");
+    expect(vi.mocked(fetch).mock.calls).toHaveLength(callsBeforeLeave);
     expect(raw.match(/"start_time":/g)).toHaveLength(2);
     expect(raw.match(/"end_time":/g)).toHaveLength(2);
     const rangeStart = now() - 7200;
@@ -2288,6 +2667,12 @@ describe("unified 90-day retention", () => {
     await applyD1Migrations(env.DB, migrations.slice(0, 4));
     const { i } = await fixture();
     const sentAt = now() - 20 * 86400;
+    // Seed the pre-upgrade schema directly; current saveChat requires the new columns.
+    await env.DB.prepare(
+      "INSERT INTO chats(installation_id,source_key,chat_id,chat_type,title) VALUES(?,'business:conn-a','77','private','Legacy chat')",
+    )
+      .bind(i.id)
+      .run();
     for (let n = 1; n <= 8; n++) {
       const update = msg(n, `legacy message ${n}`);
       update.business_message!.date = sentAt;
@@ -2300,7 +2685,18 @@ describe("unified 90-day retention", () => {
           file_id: `legacy-${n}`,
           file_name: `legacy-${n}.pdf`,
         };
-      await materialize(env.DB, i.id, update);
+      await env.DB.prepare(
+        "INSERT INTO messages(installation_id,source_key,chat_id,message_id,sent_at,text,media_type,last_update) VALUES(?,'business:conn-a','77',?,?,?,?,?)",
+      )
+        .bind(
+          i.id,
+          n,
+          sentAt,
+          `legacy message ${n}`,
+          n % 2 ? "photo" : "document",
+          n,
+        )
+        .run();
       await stageImage(env, i.id, update);
       await stageDocument(env, i.id, update);
     }

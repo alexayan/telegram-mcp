@@ -15,12 +15,24 @@ interface Results {
   getBusinessConnection: BusinessConnection;
   getUpdates: TelegramUpdate[];
   getFile: { file_path?: string; file_size?: number };
+  getChatMember: { status: string; is_member?: boolean };
 }
 export async function telegram<M extends keyof Results>(
   token: string,
   method: M,
   params: Record<string, unknown> = {},
 ): Promise<Results[M]> {
+  return telegramRequest<Results[M]>(token, method, params);
+}
+// Deliberately separate from the read-only API. Only the authenticated management RPC uses this.
+export async function leaveTelegramChannel(token: string, chatId: string) {
+  return telegramRequest<boolean>(token, "leaveChat", { chat_id: chatId });
+}
+async function telegramRequest<T>(
+  token: string,
+  method: keyof Results | "leaveChat",
+  params: Record<string, unknown>,
+): Promise<T> {
   let response: Response;
   try {
     response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
@@ -38,7 +50,7 @@ export async function telegram<M extends keyof Results>(
     throw new TelegramError(502);
   let body: {
     ok: boolean;
-    result: Results[M];
+    result: T;
     error_code?: number;
     parameters?: { retry_after?: number };
   };
