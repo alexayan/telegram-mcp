@@ -140,6 +140,8 @@ npm run deploy
 
 ## 撤销、删除、轮换
 
+- MCP access token 有效期 15 分钟，客户端使用轮换的 refresh token 自动续期。新授权的 refresh token 和新注册的 OAuth 客户端不设自动过期时间；支持自动刷新的客户端可长期保持连接，直到主动撤销、暂停、删除或更新 Bot Token 导致授权失效。
+- 从固定 30 天授权升级后，旧授权仍保留原到期时间。请在客户端移除并重新添加 MCP 服务，重新完成 OAuth（使用动态客户端注册的客户端也需重新注册），使长期授权生效。
 - `/manage` 输入有效 bot token 登录（10 分钟管理会话）。撤销首先提升 D1 epoch，MCP 立即拒绝旧授权，再清理 OAuth grant。暂停同步还会删除待处理 inbox。
 - 删除移除 DO 凭证/inbox/进度、D1 安装/连接/消息/图片与附件索引/会话及该安装全部 R2 对象，并撤销 OAuth grant。云平台备份、D1 Time Travel 和基础设施日志的保留窗口独立于应用删除，不能承诺即时物理擦除。
 - Telegram token 轮换：在 BotFather 重新生成 token，然后在本服务重新授权/管理登录。bot ID 不变时更新密文并提升 epoch，旧 MCP 授权需重新连接。

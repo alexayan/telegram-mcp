@@ -1579,7 +1579,7 @@ describe("OAuth → Telegram → MCP", () => {
       code: "enrollment_unavailable",
     });
   });
-  it("completes browser consent + PKCE, exposes six read tools with time filters, and rejects token reuse after revocation", async () => {
+  it("completes PKCE, exposes six read tools, keeps refresh grants beyond a year, and revokes them in management", async () => {
     const client = await registerClient("<script>alert(1)</script>");
     const verifier = "x".repeat(64),
       challenge = await hash(verifier);
@@ -1651,15 +1651,30 @@ describe("OAuth → Telegram → MCP", () => {
     const tokens = await exchange.json<{
       access_token: string;
       refresh_token: string;
+      expires_in: number;
     }>();
     expect(tokens.access_token).toBeTruthy();
     expect(tokens.refresh_token).toBeTruthy();
-    const rpc = (method: string, params: Record<string, unknown> = {}) =>
+    expect(tokens.expires_in).toBe(900);
+    // Clock simulation does not advance KV's storage clock. Check the actual KV expiry too.
+    const registrations = await env.OAUTH_KV.list({
+      prefix: `client:${client.clientId}`,
+    });
+    expect(registrations.keys).toHaveLength(1);
+    expect(registrations.keys[0].expiration).toBeUndefined();
+    const grants = await env.OAUTH_KV.list({ prefix: `grant:${i.id}:` });
+    expect(grants.keys).toHaveLength(1);
+    expect(grants.keys[0].expiration).toBeUndefined();
+    const rpc = (
+      method: string,
+      params: Record<string, unknown> = {},
+      accessToken = tokens.access_token,
+    ) =>
       call(
         request("/mcp", {
           method: "POST",
           headers: {
-            Authorization: `Bearer ${tokens.access_token}`,
+            Authorization: `Bearer ${accessToken}`,
             "Content-Type": "application/json",
             Accept: "application/json, text/event-stream",
             "MCP-Protocol-Version": "2026-07-28",
@@ -1830,20 +1845,46 @@ describe("OAuth → Telegram → MCP", () => {
       }),
     );
     expect(legacy.status, await legacy.text()).toBe(200);
-    const refreshed = await call(
-      post("/oauth/token", {
-        grant_type: "refresh_token",
-        refresh_token: tokens.refresh_token,
-        client_id: client.clientId,
-        resource: `${origin}/mcp`,
-      }),
-    );
-    expect(refreshed.status).toBe(200);
-    const rotated = await refreshed.json<{
+    let rotated: {
       access_token: string;
       refresh_token: string;
-    }>();
-    expect(rotated.refresh_token).not.toBe(tokens.refresh_token);
+      expires_in: number;
+    } = tokens;
+    const issuedAt = Date.now();
+    const clock = vi.spyOn(Date, "now");
+    try {
+      for (const days of [31, 366]) {
+        clock.mockReturnValue(issuedAt + days * 86400_000);
+        // Access tokens still expire; a long idle interval must not force re-consent.
+        expect((await rpc("tools/list")).status).toBe(401);
+        const previousRefresh = rotated.refresh_token;
+        const refreshed = await call(
+          post("/oauth/token", {
+            grant_type: "refresh_token",
+            refresh_token: previousRefresh,
+            client_id: client.clientId,
+            resource: `${origin}/mcp`,
+          }),
+        );
+        expect(refreshed.status).toBe(200);
+        rotated = await refreshed.json<typeof rotated>();
+        expect(rotated.refresh_token).not.toBe(previousRefresh);
+        expect(rotated.expires_in).toBe(900);
+        expect((await rpc("tools/list", {}, rotated.access_token)).status).toBe(
+          200,
+        );
+        const currentGrants = await env.OAUTH_KV.list({
+          prefix: `grant:${i.id}:`,
+        });
+        expect(currentGrants.keys).toHaveLength(1);
+        expect(currentGrants.keys[0].expiration).toBeUndefined();
+      }
+    } finally {
+      clock.mockRestore();
+    }
+    expect((await rpc("tools/list", {}, rotated.access_token)).status).toBe(
+      200,
+    );
     const manage = await call(
       request("/manage", { headers: { Cookie: browserCookie } }),
     );
@@ -1856,6 +1897,16 @@ describe("OAuth → Telegram → MCP", () => {
     );
     expect(revoked.status).toBe(200);
     expect((await rpc("tools/list")).status).toBe(401);
+    expect((await rpc("tools/list", {}, rotated.access_token)).status).toBe(
+      401,
+    );
+    expect(await getInstallation(env.DB, i.id)).toMatchObject({
+      status: "active",
+      epoch: i.epoch + 1,
+    });
+    expect(
+      (await env.OAUTH_KV.list({ prefix: `grant:${i.id}:` })).keys,
+    ).toHaveLength(0);
     const deadRefresh = await call(
       post("/oauth/token", {
         grant_type: "refresh_token",

@@ -21,7 +21,10 @@ export function provider(env: Env) {
     },
     clientIdMetadataDocumentEnabled: true,
     accessTokenTTL: 900,
-    refreshTokenTTL: 30 * 86400,
+    // Explicit undefined overrides the provider defaults: keep grants until revoked.
+    refreshTokenTTL: undefined,
+    // A permanent grant must not outlive a dynamically registered client record.
+    clientRegistrationTTL: undefined,
     onError(error) {
       console.warn(
         JSON.stringify({
